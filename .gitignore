@@ -1,0 +1,4 @@
+.env
+embeddings/
+uploaded_pdfs/
+venv
