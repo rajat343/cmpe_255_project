@@ -2,3 +2,5 @@
 embeddings/
 uploaded_pdfs/
 venv
+__pycache__/
+*.db
