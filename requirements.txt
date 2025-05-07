@@ -1,10 +1,7 @@
-langchain==0.0.184
-PyPDF2==3.0.1
-python-dotenv==1.0.0
-streamlit==1.18.1
-faiss-cpu==1.7.4
-streamlit-extras
-langchain-openai==0.2.5
-langchain-community==0.3.5
-streamlit_lottie==0.0.5
-# tiktoken==0.4.0
+streamlit>=1.18.0
+python-dotenv>=0.21.0
+langchain>=0.0.268
+langchain-core>=0.0.268
+openai>=0.27.0
+faiss-cpu>=1.7.2
+pydantic>=2.1.1
