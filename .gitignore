@@ -1,9 +1,6 @@
-__pycache__
-data
-storage
+embeddings/
+extracted_images/
+uploaded_pdfs/
 venv
 .env
-embeddings/
-uploaded_pdfs/
-extracted_images/
-
+pdf_text.db
