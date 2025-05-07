@@ -84,7 +84,7 @@ def get_or_create_vectorstore(pdf_paths: List[Path]) -> FAISS:
     return vs
 
 def setup_chain(vs: FAISS) -> ConversationalRetrievalChain:
-    llm = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0)
+    llm = ChatOpenAI(model="gpt-4-turbo", temperature=0.3)
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         output_key="answer",
