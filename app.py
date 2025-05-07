@@ -36,6 +36,14 @@ def process_pdf(pdf_file) -> Tuple[str, Path]:
         dest.write_bytes(content)
     return h, dest
 
+def is_pdf_processed(pdf_hash: str, db_path: Path) -> bool:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM pdf_text WHERE hash = ?", (pdf_hash,))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
 def extract_text_from_pdf(pdf_path: Path) -> str:
     reader = PdfReader(str(pdf_path))
     text_pages = [page.extract_text() for page in reader.pages if page.extract_text()]
@@ -46,8 +54,7 @@ def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_pa
     image_paths = []
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-
-    # Delete existing images for this PDF hash to avoid duplicates
+    # Remove old images for this PDF
     cur.execute("DELETE FROM pdf_images WHERE pdf_hash = ?", (pdf_hash,))
 
     for page_index in range(len(doc)):
@@ -60,8 +67,7 @@ def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_pa
             with open(image_path, "wb") as f:
                 f.write(image_bytes)
             image_paths.append(str(image_path))
-
-            # Store image bytes in DB
+            # store in DB
             cur.execute("""
                 INSERT INTO pdf_images (pdf_hash, filename, image_data, page_number, img_index, ext)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -97,7 +103,6 @@ def init_text_db(db_path: Path):
 
 def extract_and_store_text(pdf_path: Path, pdf_hash: str, db_path: Path) -> str:
     full_text = extract_text_from_pdf(pdf_path)
-
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("DELETE FROM pdf_text WHERE hash = ?", (pdf_hash,))
@@ -147,14 +152,16 @@ def display_stored_images(db_path: Path):
         cur = conn.cursor()
         cur.execute("SELECT DISTINCT filename FROM pdf_images")
         files = [row[0] for row in cur.fetchall()]
-
         selected_file = st.selectbox("Select a PDF", files, key="image_viewer_select")
         if selected_file:
             cur.execute("SELECT image_data, page_number, img_index, ext FROM pdf_images WHERE filename = ?", (selected_file,))
-            rows = cur.fetchall()
-            for img_data, page_num, img_idx, ext in rows:
+            for img_data, page_num, img_idx, ext in cur.fetchall():
                 image = Image.open(io.BytesIO(img_data))
-                st.image(image, caption=f"{selected_file} - Page {page_num}, Image {img_idx}", use_container_width=True)
+                st.image(
+                    image,
+                    caption=f"{selected_file} – Page {page_num}, Image {img_idx}",
+                    use_container_width=True
+                )
         conn.close()
 
 def display_stored_text(db_path: Path):
@@ -163,13 +170,12 @@ def display_stored_text(db_path: Path):
         cur = conn.cursor()
         cur.execute("SELECT DISTINCT filename FROM pdf_text")
         files = [row[0] for row in cur.fetchall()]
-
-        selected_file = st.selectbox("Select a PDF to view its extracted text", files, key="text_viewer_select")
+        selected_file = st.selectbox("Select a PDF to view its text", files, key="text_viewer_select")
         if selected_file:
             cur.execute("SELECT content FROM pdf_text WHERE filename = ?", (selected_file,))
             result = cur.fetchone()
             if result:
-                preview = result[0][:50000]  # show up to 5000 characters
+                preview = result[0][:50000]
                 st.text_area("Preview:", value=preview, height=400)
         conn.close()
 
@@ -179,38 +185,35 @@ def display_stored_eda(db_path: Path):
         cur = conn.cursor()
         cur.execute("SELECT DISTINCT filename FROM pdf_text")
         files = [row[0] for row in cur.fetchall()]
-        selected_file = st.selectbox("Select a PDF to view its EDA", files, key="eda_viewer_select")
+        selected_file = st.selectbox("Select a PDF for EDA", files, key="eda_viewer_select")
         if selected_file:
             cur.execute("SELECT content FROM pdf_text WHERE filename = ?", (selected_file,))
-            result = cur.fetchone()
-            if result:
-                text = result[0]
-                words = re.findall(r'\b\w+\b', text.lower())
-                word_counts = Counter(words)
-                common_words = word_counts.most_common(10)
-                if common_words:
-                    df = pd.DataFrame(common_words, columns=["Word", "Frequency"])
-                    st.dataframe(df)
-                    fig, ax = plt.subplots()
-                    df.plot(kind='bar', x='Word', y='Frequency', ax=ax, legend=False)
-                    plt.title("Top 10 Most Common Words")
-                    st.pyplot(fig)
-                sentences = re.split(r'[.!?]', text)
-                sentence_lengths = [len(s.split()) for s in sentences if len(s.strip()) > 0]
-                if sentence_lengths:
-                    st.markdown(f"Average sentence length: **{round(sum(sentence_lengths)/len(sentence_lengths), 2)}**")
-                    fig2, ax2 = plt.subplots()
-                    ax2.hist(sentence_lengths, bins=20, edgecolor='black')
-                    ax2.set_title("Sentence Length Distribution")
-                    ax2.set_xlabel("Words per sentence")
-                    ax2.set_ylabel("Frequency")
-                    st.pyplot(fig2)
-                else:
-                    st.info("No sentences found for length distribution.")
+            text = cur.fetchone()[0]
+            words = re.findall(r'\b\w+\b', text.lower())
+            word_counts = Counter(words)
+            df = pd.DataFrame(word_counts.most_common(10), columns=["Word", "Frequency"])
+            st.dataframe(df)
+            fig, ax = plt.subplots()
+            df.plot(kind='bar', x='Word', y='Frequency', ax=ax, legend=False)
+            ax.set_title("Top 10 Words")
+            st.pyplot(fig)
+
+            sentences = re.split(r'[.!?]', text)
+            lengths = [len(s.split()) for s in sentences if s.strip()]
+            if lengths:
+                avg_len = round(sum(lengths) / len(lengths), 2)
+                st.markdown(f"Average sentence length: **{avg_len}** words")
+                fig2, ax2 = plt.subplots()
+                ax2.hist(lengths, bins=20, edgecolor='black')
+                ax2.set_title("Sentence Length Distribution")
+                ax2.set_xlabel("Words per sentence")
+                ax2.set_ylabel("Frequency")
+                st.pyplot(fig2)
         conn.close()
 
-load_dotenv()
+# ──────────────────────────────────────────────────────────
 
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Please set OPENAI_API_KEY in your .env file")
@@ -230,6 +233,7 @@ def main():
     st.set_page_config(page_title="PDF Chat Assistant", page_icon="📚", layout="centered")
     st.title("📚 PDF Chat Assistant")
 
+    # Initialize chat/session state
     if "qa_cache" not in st.session_state:
         st.session_state.qa_cache = {}
     if "chat_history" not in st.session_state:
@@ -241,34 +245,51 @@ def main():
         st.session_state.pop("vectorstore", None)
         st.session_state.pop("conversation_chain", None)
 
+    # --- File upload & processing ---
+    uploaded = st.file_uploader("Upload PDF documents", type="pdf", accept_multiple_files=True)
+    new_uploads = False
+    pdf_paths: List[Path] = []
+
+    if uploaded:
+        for f in uploaded:
+            h, p = process_pdf(f)
+            pdf_paths.append(p)
+
+            if not is_pdf_processed(h, TEXT_DB_PATH):
+                # first‐time extraction
+                imgs = extract_images_from_pdf(p, IMAGES_DIR, h, TEXT_DB_PATH)
+                st.sidebar.write(f"Extracted {len(imgs)} images from {p.name}")
+                txt = extract_and_store_text(p, h, TEXT_DB_PATH)
+                st.sidebar.write(f"Stored text from {p.name}")
+                new_uploads = True
+
+        if new_uploads:
+            # force rebuild vectorstore & chain to include new docs
+            st.session_state.pop("vectorstore", None)
+            st.session_state.pop("conversation_chain", None)
+
+    # --- Display stored content dropdowns dynamically ---
     display_stored_images(TEXT_DB_PATH)
     display_stored_text(TEXT_DB_PATH)
     display_stored_eda(TEXT_DB_PATH)
 
-    uploaded = st.file_uploader("Upload PDF documents", type="pdf", accept_multiple_files=True)
+    # if no files, stop here
     if not uploaded:
         return
 
-    pdf_paths: List[Path] = []
-    for f in uploaded:
-        h, p = process_pdf(f)
-        pdf_paths.append(p)
-        extracted_images = extract_images_from_pdf(p, IMAGES_DIR, h, TEXT_DB_PATH)
-        st.sidebar.write(f"Extracted and stored {len(extracted_images)} images from {p.name}")
-
-        text_content = extract_and_store_text(p, h, TEXT_DB_PATH)
-        st.sidebar.write(f"Stored text content from {p.name} in database.")
-
+    # --- Embeddings & Chat chain setup (cached across runs) ---
     if "vectorstore" not in st.session_state:
         st.session_state.vectorstore = get_or_create_vectorstore(pdf_paths)
 
     if "conversation_chain" not in st.session_state:
         st.session_state.conversation_chain = setup_chain(st.session_state.vectorstore)
 
+    # --- Render prior chat history ---
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    # --- New user query ---
     q = st.chat_input("Ask about your PDFs…")
     if not q:
         return
