@@ -229,23 +229,44 @@ IMAGES_DIR.mkdir(exist_ok=True)
 
 init_text_db(TEXT_DB_PATH)
 
+def run_user_code(code: str):
+    before = set(plt.get_fignums())
+    user_ns = {
+        "plt": plt,
+        "pd": pd,
+        "io": io,
+        "Image": Image,
+        "st": st,
+    }
+    try:
+        exec(code, user_ns)
+    except Exception as e:
+        return f"❌ Error running code: {e}"
+    after = set(plt.get_fignums())
+    new_figs = after - before
+    if not new_figs:
+        return "⚠️ No new figures were created by your code."
+    for fig_num in sorted(new_figs):
+        fig = plt.figure(fig_num)
+        st.pyplot(fig)
+        plt.close(fig)
+    return "✅ Executed your code and displayed the new figure(s)."
+
 def main():
     st.set_page_config(page_title="PDF Chat Assistant", page_icon="📚", layout="centered")
     st.title("📚 PDF Chat Assistant")
 
-    # Initialize chat/session state
-    if "qa_cache" not in st.session_state:
-        st.session_state.qa_cache = {}
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    # Session state
+    st.session_state.setdefault("qa_cache", {})
+    st.session_state.setdefault("chat_history", [])
 
     if st.sidebar.button("Clear Chat History"):
-        st.session_state.chat_history = []
-        st.session_state.qa_cache = {}
-        st.session_state.pop("vectorstore", None)
-        st.session_state.pop("conversation_chain", None)
+        st.session_state.chat_history.clear()
+        st.session_state.qa_cache.clear()
+        for k in ["vectorstore", "conversation_chain"]:
+            st.session_state.pop(k, None)
 
-    # --- File upload & processing ---
+    # PDF upload & processing
     uploaded = st.file_uploader("Upload PDF documents", type="pdf", accept_multiple_files=True)
     new_uploads = False
     pdf_paths: List[Path] = []
@@ -256,55 +277,65 @@ def main():
             pdf_paths.append(p)
 
             if not is_pdf_processed(h, TEXT_DB_PATH):
-                # first‐time extraction
-                imgs = extract_images_from_pdf(p, IMAGES_DIR, h, TEXT_DB_PATH)
-                st.sidebar.write(f"Extracted {len(imgs)} images from {p.name}")
-                txt = extract_and_store_text(p, h, TEXT_DB_PATH)
-                st.sidebar.write(f"Stored text from {p.name}")
+                extract_images_from_pdf(p, IMAGES_DIR, h, TEXT_DB_PATH)
+                extract_and_store_text(p, h, TEXT_DB_PATH)
                 new_uploads = True
-
         if new_uploads:
-            # force rebuild vectorstore & chain to include new docs
-            st.session_state.pop("vectorstore", None)
-            st.session_state.pop("conversation_chain", None)
+            for k in ["vectorstore", "conversation_chain"]:
+                st.session_state.pop(k, None)
 
-    # --- Display stored content dropdowns dynamically ---
+    # Sidebars: images, text, EDA
     display_stored_images(TEXT_DB_PATH)
     display_stored_text(TEXT_DB_PATH)
     display_stored_eda(TEXT_DB_PATH)
 
-    # if no files, stop here
     if not uploaded:
         return
 
-    # --- Embeddings & Chat chain setup (cached across runs) ---
+    # Initialize or reuse vectorstore & chain
     if "vectorstore" not in st.session_state:
         st.session_state.vectorstore = get_or_create_vectorstore(pdf_paths)
 
     if "conversation_chain" not in st.session_state:
         st.session_state.conversation_chain = setup_chain(st.session_state.vectorstore)
 
-    # --- Render prior chat history ---
+    # Render prior chat
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # --- New user query ---
-    q = st.chat_input("Ask about your PDFs…")
+    # New user input
+    q = st.chat_input("Ask about PDFs, paste Python code in ```python…``` to run it.")
     if not q:
         return
 
+    # Echo user
     st.session_state.chat_history.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.markdown(q)
 
+    # 1) Check for Python code blocks
+    code_blocks = re.findall(r"```python(.*?)```", q, flags=re.DOTALL)
+    if code_blocks:
+        # Run each block
+        for block in code_blocks:
+            result = run_user_code(block)
+            st.markdown(result)
+        answer = "Executed your Python code above."
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        return
+
+    # 2) Otherwise fallback to PDF Q&A
     with st.spinner("Processing your query…"):
         if q in st.session_state.qa_cache:
             answer = "(From cache) " + st.session_state.qa_cache[q]
         else:
-            resp = st.session_state.conversation_chain(
-                {"question": q, "chat_history": st.session_state.chat_history}
-            )
+            resp = st.session_state.conversation_chain({
+                "question": q,
+                "chat_history": st.session_state.chat_history
+            })
             docs = resp.get("source_documents", [])
             if docs:
                 answer = resp["answer"]
@@ -315,8 +346,8 @@ def main():
                     "Try a different query or upload more documents."
                 )
 
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
-
+    # Display answer
+    st.session_state.chat_history.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.markdown(answer)
 
