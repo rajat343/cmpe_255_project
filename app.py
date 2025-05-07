@@ -8,13 +8,53 @@ from langchain_community.embeddings import OpenAIEmbeddings
 from langchain.document_loaders import PyPDFLoader
 from langchain.vectorstores import FAISS
 from langchain_core.callbacks.manager import Callbacks
-from langchain_core.caches import BaseCache  
+from langchain_core.caches import BaseCache
 from langchain.chat_models import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.docstore.document import Document
 
+import collections
+import sqlite3
+import fitz  # PyMuPDF
+import matplotlib.pyplot as plt
+
 ChatOpenAI.model_rebuild()
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    st.error("Please set OPENAI_API_KEY in your .env file")
+
+HERE = Path(__file__).parent
+UPLOAD_DIR = HERE / "uploaded_pdfs"
+EMBEDDINGS_DIR = HERE / "embeddings"
+UPLOAD_DIR.mkdir(exist_ok=True)
+EMBEDDINGS_DIR.mkdir(exist_ok=True)
+
+DB_PATH = HERE / "pdf_data.db"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+cur = conn.cursor()
+cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS extracted_text (
+        pdf_hash TEXT,
+        page_num INTEGER,
+        content TEXT
+    )
+    """
+)
+cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS extracted_images (
+        pdf_hash TEXT,
+        page_num INTEGER,
+        img_index INTEGER,
+        image_path TEXT
+    )
+    """
+)
+conn.commit()
 
 def get_pdf_hash(pdf_content: bytes) -> str:
     return hashlib.md5(pdf_content).hexdigest()
@@ -60,17 +100,48 @@ def setup_chain(vs: FAISS) -> ConversationalRetrievalChain:
     )
 
 
-load_dotenv()
+def extract_and_store(pdf_paths: List[Path]) -> None:
+    """Extract text & images and insert into SQLite tables"""
+    for p in pdf_paths:
+        h = p.stem
+        doc = fitz.open(p)
+        for i, page in enumerate(doc):
+            text = page.get_text()
+            cur.execute(
+                "INSERT INTO extracted_text VALUES (?,?,?)",
+                (h, i, text),
+            )
+            for img_idx, img in enumerate(page.get_images(full=True)):
+                xref = img[0]
+                pix = fitz.Pixmap(doc, xref)
+                img_path = UPLOAD_DIR / f"{h}_page{i}_img{img_idx}.png"
+                pix.save(img_path)
+                cur.execute(
+                    "INSERT INTO extracted_images VALUES (?,?,?,?)",
+                    (h, i, img_idx, str(img_path)),
+                )
+        conn.commit()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("Please set OPENAI_API_KEY in your .env file")
 
-HERE = Path(__file__).parent
-UPLOAD_DIR = HERE / "uploaded_pdfs"
-EMBEDDINGS_DIR = HERE / "embeddings"
-UPLOAD_DIR.mkdir(exist_ok=True)
-EMBEDDINGS_DIR.mkdir(exist_ok=True)
+def run_text_eda(pdf_hash: str):
+    cur.execute("SELECT content FROM extracted_text WHERE pdf_hash=?", (pdf_hash,))
+    rows = cur.fetchall()
+    if not rows:
+        return None
+    all_text = " ".join(r[0] for r in rows)
+    words = all_text.split()
+    freq = collections.Counter(words)
+    top10 = freq.most_common(10)
+    if not top10:
+        return None
+    labels, counts = zip(*top10)
+    fig, ax = plt.subplots()
+    ax.bar(labels, counts)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_title(f"Top 10 words for {pdf_hash}")
+    plt.tight_layout()
+    return fig
+
 
 def main():
     st.set_page_config(page_title="PDF Chat Assistant", page_icon="📚", layout="centered")
@@ -81,12 +152,6 @@ def main():
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    if st.sidebar.button("Clear Chat History"):
-        st.session_state.chat_history = []
-        st.session_state.qa_cache = {}
-        st.session_state.pop("vectorstore", None)
-        st.session_state.pop("conversation_chain", None)
-
     uploaded = st.file_uploader("Upload PDF documents", type="pdf", accept_multiple_files=True)
     if not uploaded:
         return
@@ -95,6 +160,21 @@ def main():
     for f in uploaded:
         _, p = process_pdf(f)
         pdf_paths.append(p)
+
+    # extract & store data
+    extract_and_store(pdf_paths)
+
+    if st.sidebar.button("Run EDA"):
+        for p in pdf_paths:
+            fig = run_text_eda(p.stem)
+            if fig:
+                st.pyplot(fig)
+
+    if st.sidebar.button("Clear Chat History"):
+        st.session_state.chat_history = []
+        st.session_state.qa_cache = {}
+        st.session_state.pop("vectorstore", None)
+        st.session_state.pop("conversation_chain", None)
 
     if "vectorstore" not in st.session_state:
         st.session_state.vectorstore = get_or_create_vectorstore(pdf_paths)

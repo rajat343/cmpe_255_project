@@ -1,4 +1,6 @@
 .env
+__pycache__/
 embeddings/
 uploaded_pdfs/
 venv
+*.db
