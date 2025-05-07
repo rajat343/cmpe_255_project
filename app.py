@@ -5,14 +5,23 @@ from typing import List, Tuple
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_community.embeddings import OpenAIEmbeddings
-from langchain.document_loaders import PyPDFLoader
-from langchain.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
 from langchain_core.callbacks.manager import Callbacks
 from langchain_core.caches import BaseCache  
-from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.docstore.document import Document
+import fitz  # PyMuPDF for image extraction
+import sqlite3  # For storing extracted text and images
+from PIL import Image
+import io
+import pandas as pd
+import matplotlib.pyplot as plt
+from collections import Counter
+import re
+from PyPDF2 import PdfReader
 
 ChatOpenAI.model_rebuild()
 
@@ -26,6 +35,79 @@ def process_pdf(pdf_file) -> Tuple[str, Path]:
     if not dest.exists():
         dest.write_bytes(content)
     return h, dest
+
+def extract_text_from_pdf(pdf_path: Path) -> str:
+    reader = PdfReader(str(pdf_path))
+    text_pages = [page.extract_text() for page in reader.pages if page.extract_text()]
+    return "\n".join(text_pages)
+
+def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_path: Path) -> List[str]:
+    doc = fitz.open(str(pdf_path))
+    image_paths = []
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    # Delete existing images for this PDF hash to avoid duplicates
+    cur.execute("DELETE FROM pdf_images WHERE pdf_hash = ?", (pdf_hash,))
+
+    for page_index in range(len(doc)):
+        for img_index, img in enumerate(doc[page_index].get_images(full=True)):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            ext = base_image["ext"]
+            image_path = save_dir / f"{pdf_path.stem}_page{page_index+1}_img{img_index+1}.{ext}"
+            with open(image_path, "wb") as f:
+                f.write(image_bytes)
+            image_paths.append(str(image_path))
+
+            # Store image bytes in DB
+            cur.execute("""
+                INSERT INTO pdf_images (pdf_hash, filename, image_data, page_number, img_index, ext)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (pdf_hash, pdf_path.name, image_bytes, page_index + 1, img_index + 1, ext))
+
+    conn.commit()
+    conn.close()
+    return image_paths
+
+def init_text_db(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pdf_text (
+            hash TEXT PRIMARY KEY,
+            filename TEXT,
+            content TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pdf_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pdf_hash TEXT,
+            filename TEXT,
+            image_data BLOB,
+            page_number INTEGER,
+            img_index INTEGER,
+            ext TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def extract_and_store_text(pdf_path: Path, pdf_hash: str, db_path: Path) -> str:
+    full_text = extract_text_from_pdf(pdf_path)
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM pdf_text WHERE hash = ?", (pdf_hash,))
+    cur.execute(
+        "INSERT INTO pdf_text (hash, filename, content) VALUES (?, ?, ?)",
+        (pdf_hash, pdf_path.name, full_text)
+    )
+    conn.commit()
+    conn.close()
+    return full_text
 
 def get_or_create_vectorstore(pdf_paths: List[Path]) -> FAISS:
     combined = hashlib.md5("".join(sorted(map(str, pdf_paths))).encode()).hexdigest()
@@ -59,6 +141,73 @@ def setup_chain(vs: FAISS) -> ConversationalRetrievalChain:
         verbose=True
     )
 
+def display_stored_images(db_path: Path):
+    with st.sidebar.expander("📷 View Extracted Images", expanded=False):
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT filename FROM pdf_images")
+        files = [row[0] for row in cur.fetchall()]
+
+        selected_file = st.selectbox("Select a PDF", files, key="image_viewer_select")
+        if selected_file:
+            cur.execute("SELECT image_data, page_number, img_index, ext FROM pdf_images WHERE filename = ?", (selected_file,))
+            rows = cur.fetchall()
+            for img_data, page_num, img_idx, ext in rows:
+                image = Image.open(io.BytesIO(img_data))
+                st.image(image, caption=f"{selected_file} - Page {page_num}, Image {img_idx}", use_container_width=True)
+        conn.close()
+
+def display_stored_text(db_path: Path):
+    with st.sidebar.expander("📝 View Extracted Text", expanded=False):
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT filename FROM pdf_text")
+        files = [row[0] for row in cur.fetchall()]
+
+        selected_file = st.selectbox("Select a PDF to view its extracted text", files, key="text_viewer_select")
+        if selected_file:
+            cur.execute("SELECT content FROM pdf_text WHERE filename = ?", (selected_file,))
+            result = cur.fetchone()
+            if result:
+                preview = result[0][:50000]  # show up to 5000 characters
+                st.text_area("Preview:", value=preview, height=400)
+        conn.close()
+
+def display_stored_eda(db_path: Path):
+    with st.sidebar.expander("📈 View EDA (Word & Sentence Analysis)", expanded=False):
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT filename FROM pdf_text")
+        files = [row[0] for row in cur.fetchall()]
+        selected_file = st.selectbox("Select a PDF to view its EDA", files, key="eda_viewer_select")
+        if selected_file:
+            cur.execute("SELECT content FROM pdf_text WHERE filename = ?", (selected_file,))
+            result = cur.fetchone()
+            if result:
+                text = result[0]
+                words = re.findall(r'\b\w+\b', text.lower())
+                word_counts = Counter(words)
+                common_words = word_counts.most_common(10)
+                if common_words:
+                    df = pd.DataFrame(common_words, columns=["Word", "Frequency"])
+                    st.dataframe(df)
+                    fig, ax = plt.subplots()
+                    df.plot(kind='bar', x='Word', y='Frequency', ax=ax, legend=False)
+                    plt.title("Top 10 Most Common Words")
+                    st.pyplot(fig)
+                sentences = re.split(r'[.!?]', text)
+                sentence_lengths = [len(s.split()) for s in sentences if len(s.strip()) > 0]
+                if sentence_lengths:
+                    st.markdown(f"Average sentence length: **{round(sum(sentence_lengths)/len(sentence_lengths), 2)}**")
+                    fig2, ax2 = plt.subplots()
+                    ax2.hist(sentence_lengths, bins=20, edgecolor='black')
+                    ax2.set_title("Sentence Length Distribution")
+                    ax2.set_xlabel("Words per sentence")
+                    ax2.set_ylabel("Frequency")
+                    st.pyplot(fig2)
+                else:
+                    st.info("No sentences found for length distribution.")
+        conn.close()
 
 load_dotenv()
 
@@ -69,8 +218,13 @@ if not OPENAI_API_KEY:
 HERE = Path(__file__).parent
 UPLOAD_DIR = HERE / "uploaded_pdfs"
 EMBEDDINGS_DIR = HERE / "embeddings"
+IMAGES_DIR = HERE / "extracted_images"
+TEXT_DB_PATH = HERE / "pdf_text.db"
 UPLOAD_DIR.mkdir(exist_ok=True)
 EMBEDDINGS_DIR.mkdir(exist_ok=True)
+IMAGES_DIR.mkdir(exist_ok=True)
+
+init_text_db(TEXT_DB_PATH)
 
 def main():
     st.set_page_config(page_title="PDF Chat Assistant", page_icon="📚", layout="centered")
@@ -87,14 +241,23 @@ def main():
         st.session_state.pop("vectorstore", None)
         st.session_state.pop("conversation_chain", None)
 
+    display_stored_images(TEXT_DB_PATH)
+    display_stored_text(TEXT_DB_PATH)
+    display_stored_eda(TEXT_DB_PATH)
+
     uploaded = st.file_uploader("Upload PDF documents", type="pdf", accept_multiple_files=True)
     if not uploaded:
         return
 
     pdf_paths: List[Path] = []
     for f in uploaded:
-        _, p = process_pdf(f)
+        h, p = process_pdf(f)
         pdf_paths.append(p)
+        extracted_images = extract_images_from_pdf(p, IMAGES_DIR, h, TEXT_DB_PATH)
+        st.sidebar.write(f"Extracted and stored {len(extracted_images)} images from {p.name}")
+
+        text_content = extract_and_store_text(p, h, TEXT_DB_PATH)
+        st.sidebar.write(f"Stored text content from {p.name} in database.")
 
     if "vectorstore" not in st.session_state:
         st.session_state.vectorstore = get_or_create_vectorstore(pdf_paths)

@@ -2,5 +2,5 @@
 embeddings/
 uploaded_pdfs/
 venv
-__pycache__/
-*.db
+extracted_images/
+pdf_text.db
