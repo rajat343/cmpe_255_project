@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import List, Tuple
 import streamlit as st
 from dotenv import load_dotenv
-from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain.document_loaders import PyPDFLoader
 from langchain.vectorstores import FAISS
 from langchain_core.callbacks.manager import Callbacks
