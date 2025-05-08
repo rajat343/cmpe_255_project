@@ -23,6 +23,12 @@ from collections import Counter
 import re
 from PyPDF2 import PdfReader
 
+from paddleocr import PaddleOCR
+
+# Load OCR model once globally
+ocr_model = PaddleOCR(use_angle_cls=True, lang='en')
+
+
 ChatOpenAI.model_rebuild()
 
 def get_pdf_hash(pdf_content: bytes) -> str:
@@ -49,13 +55,44 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
     text_pages = [page.extract_text() for page in reader.pages if page.extract_text()]
     return "\n".join(text_pages)
 
+# def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_path: Path) -> List[str]:
+#     doc = fitz.open(str(pdf_path))
+#     image_paths = []
+#     conn = sqlite3.connect(db_path)
+#     cur = conn.cursor()
+#     # Remove old images for this PDF
+#     cur.execute("DELETE FROM pdf_images WHERE pdf_hash = ?", (pdf_hash,))
+
+#     for page_index in range(len(doc)):
+#         for img_index, img in enumerate(doc[page_index].get_images(full=True)):
+#             xref = img[0]
+#             base_image = doc.extract_image(xref)
+#             image_bytes = base_image["image"]
+#             ext = base_image["ext"]
+#             image_path = save_dir / f"{pdf_path.stem}_page{page_index+1}_img{img_index+1}.{ext}"
+#             with open(image_path, "wb") as f:
+#                 f.write(image_bytes)
+#             image_paths.append(str(image_path))
+#             # store in DB
+#             cur.execute("""
+#                 INSERT INTO pdf_images (pdf_hash, filename, image_data, page_number, img_index, ext)
+#                 VALUES (?, ?, ?, ?, ?, ?)
+#             """, (pdf_hash, pdf_path.name, image_bytes, page_index + 1, img_index + 1, ext))
+
+#     conn.commit()
+#     conn.close()
+#     return image_paths
+
+
 def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_path: Path) -> List[str]:
     doc = fitz.open(str(pdf_path))
     image_paths = []
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    # Remove old images for this PDF
+
+    # Clear old images
     cur.execute("DELETE FROM pdf_images WHERE pdf_hash = ?", (pdf_hash,))
+    conn.commit()
 
     for page_index in range(len(doc)):
         for img_index, img in enumerate(doc[page_index].get_images(full=True)):
@@ -66,12 +103,30 @@ def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_pa
             image_path = save_dir / f"{pdf_path.stem}_page{page_index+1}_img{img_index+1}.{ext}"
             with open(image_path, "wb") as f:
                 f.write(image_bytes)
+
             image_paths.append(str(image_path))
-            # store in DB
+
+            # 🧠 NEW: Run OCR
+            ocr_text = extract_text_from_image(str(image_path))
+
+            # Store in SQLite for sidebar viewer
             cur.execute("""
                 INSERT INTO pdf_images (pdf_hash, filename, image_data, page_number, img_index, ext)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (pdf_hash, pdf_path.name, image_bytes, page_index + 1, img_index + 1, ext))
+
+            # 🧠 Store OCR text in st.session_state for embedding
+            if "image_ocr_docs" not in st.session_state:
+                st.session_state.image_ocr_docs = []
+            st.session_state.image_ocr_docs.append(Document(
+                page_content=ocr_text,
+                metadata={
+                    "type": "ocr",
+                    "page": page_index + 1,
+                    "image_file": str(image_path),
+                    "source": pdf_path.name
+                }
+            ))
 
     conn.commit()
     conn.close()
@@ -114,15 +169,21 @@ def extract_and_store_text(pdf_path: Path, pdf_hash: str, db_path: Path) -> str:
     conn.close()
     return full_text
 
-def get_or_create_vectorstore(pdf_paths: List[Path]) -> FAISS:
+# def get_or_create_vectorstore(pdf_paths: List[Path]) -> FAISS:
+def get_or_create_vectorstore(pdf_paths: List[Path], extra_docs: List[Document] = []) -> FAISS:
     combined = hashlib.md5("".join(sorted(map(str, pdf_paths))).encode()).hexdigest()
     vs_path = EMBEDDINGS_DIR / combined
     embeddings = OpenAIEmbeddings()
     if vs_path.exists():
         return FAISS.load_local(str(vs_path), embeddings, allow_dangerous_deserialization=True)
+    
     docs: List[Document] = []
     for p in pdf_paths:
         docs.extend(PyPDFLoader(str(p)).load())
+
+    # Add OCR docs
+    docs.extend(extra_docs)
+
     vs = FAISS.from_documents(docs, embeddings)
     vs.save_local(str(vs_path))
     total_chars = sum(len(d.page_content) for d in docs)
@@ -252,6 +313,15 @@ def run_user_code(code: str):
         plt.close(fig)
     return "✅ Executed your code and displayed the new figure(s)."
 
+
+def extract_text_from_image(image_path: str) -> str:
+    result = ocr_model.ocr(image_path, cls=True)
+    text = []
+    for line in result[0]:
+        text.append(line[1][0])  # line[1] = (text, confidence)
+    return "\n".join(text)
+
+
 def main():
     st.set_page_config(page_title="PDF Chat Assistant", page_icon="📚", layout="centered")
     st.title("📚 PDF Chat Assistant")
@@ -277,6 +347,7 @@ def main():
             pdf_paths.append(p)
 
             if not is_pdf_processed(h, TEXT_DB_PATH):
+                st.session_state["image_ocr_docs"] = []  # ✅ Clear old OCR docs
                 extract_images_from_pdf(p, IMAGES_DIR, h, TEXT_DB_PATH)
                 extract_and_store_text(p, h, TEXT_DB_PATH)
                 new_uploads = True
@@ -294,7 +365,11 @@ def main():
 
     # Initialize or reuse vectorstore & chain
     if "vectorstore" not in st.session_state:
-        st.session_state.vectorstore = get_or_create_vectorstore(pdf_paths)
+        # Add OCR content from images to documents for vectorstore
+        ocr_docs = st.session_state.get("image_ocr_docs", [])
+        # st.session_state.vectorstore = get_or_create_vectorstore(pdf_paths)
+        st.session_state.vectorstore = get_or_create_vectorstore(pdf_paths, extra_docs=ocr_docs)
+
 
     if "conversation_chain" not in st.session_state:
         st.session_state.conversation_chain = setup_chain(st.session_state.vectorstore)
