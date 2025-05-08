@@ -13,3 +13,6 @@ matplotlib>=3.10.0
 PyPDF2>=3.0
 Pillow
 pandas
+paddlepaddle>=2.5.0
+paddleocr>=2.6.1
+setuptools>=65.0.0

@@ -106,7 +106,7 @@ def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_pa
 
             image_paths.append(str(image_path))
 
-            # 🧠 NEW: Run OCR
+            # NEW: Run OCR
             ocr_text = extract_text_from_image(str(image_path))
 
             # Store in SQLite for sidebar viewer
@@ -115,7 +115,7 @@ def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_pa
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (pdf_hash, pdf_path.name, image_bytes, page_index + 1, img_index + 1, ext))
 
-            # 🧠 Store OCR text in st.session_state for embedding
+            # Store OCR text in st.session_state for embedding
             if "image_ocr_docs" not in st.session_state:
                 st.session_state.image_ocr_docs = []
             st.session_state.image_ocr_docs.append(Document(
