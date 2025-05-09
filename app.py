@@ -13,7 +13,7 @@ from langchain_community.chat_models import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.docstore.document import Document
-import fitz  # PyMuPDF for image extraction
+import fitz  # PyMuPDF for image extraction and PDF translation
 import sqlite3  # For storing extracted text and images
 from PIL import Image
 import io
@@ -22,8 +22,71 @@ import matplotlib.pyplot as plt
 from collections import Counter
 import re
 from PyPDF2 import PdfReader
+import openai
+from tenacity import retry, wait_random_exponential, stop_after_attempt
 
 ChatOpenAI.model_rebuild()
+
+# Retry logic for transient errors (from layour.py)
+@retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(5))
+def translate_with_gpt(text, target_language):
+    prompt = f"""Translate the following text to {target_language}. Only return the translated text without commentary.
+
+{text}
+"""
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    return response["choices"][0]["message"]["content"].strip()
+
+def split_text(text, max_chars=1500):
+    # Split large blocks into smaller paragraphs
+    paragraphs = text.split("\n")
+    batches, current = [], ""
+    for para in paragraphs:
+        if len(current) + len(para) < max_chars:
+            current += para + "\n"
+        else:
+            batches.append(current.strip())
+            current = para + "\n"
+    if current.strip():
+        batches.append(current.strip())
+    return batches
+
+def translate_pdf_with_gpt(input_pdf, output_pdf, target_language="French"):
+    doc = fitz.open(input_pdf)
+    
+    progress_bar = st.progress(0)
+    total_pages = len(doc)
+    
+    for page_num, page in enumerate(doc):
+        blocks = page.get_text("blocks")
+        for i, block in enumerate(blocks):
+            x0, y0, x1, y1, text, *_ = block
+            if text.strip():
+                try:
+                    translated = ""
+                    if len(text) < 1500:
+                        translated = translate_with_gpt(text, target_language)
+                    else:
+                        parts = split_text(text)
+                        translated_parts = [translate_with_gpt(p, target_language) for p in parts]
+                        translated = "\n".join(translated_parts)
+
+                    # Overwrite original text
+                    rect = fitz.Rect(x0, y0, x1, y1)
+                    page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
+                    page.insert_text((x0, y0), translated, fontsize=10)
+                except Exception as e:
+                    st.error(f"[Page {page_num+1}] Translation error: {e}")
+        
+        # Update progress bar
+        progress_bar.progress((page_num + 1) / total_pages)
+        
+    doc.save(output_pdf)
+    return output_pdf
 
 def get_pdf_hash(pdf_content: bytes) -> str:
     return hashlib.md5(pdf_content).hexdigest()
@@ -96,6 +159,18 @@ def init_text_db(db_path: Path):
             page_number INTEGER,
             img_index INTEGER,
             ext TEXT
+        )
+    """)
+    # Add a new table for translated PDFs
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS translated_pdfs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_hash TEXT,
+            original_filename TEXT,
+            translated_hash TEXT,
+            translated_filename TEXT,
+            target_language TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -211,23 +286,89 @@ def display_stored_eda(db_path: Path):
                 st.pyplot(fig2)
         conn.close()
 
-# ──────────────────────────────────────────────────────────
-
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("Please set OPENAI_API_KEY in your .env file")
-
-HERE = Path(__file__).parent
-UPLOAD_DIR = HERE / "uploaded_pdfs"
-EMBEDDINGS_DIR = HERE / "embeddings"
-IMAGES_DIR = HERE / "extracted_images"
-TEXT_DB_PATH = HERE / "pdf_text.db"
-UPLOAD_DIR.mkdir(exist_ok=True)
-EMBEDDINGS_DIR.mkdir(exist_ok=True)
-IMAGES_DIR.mkdir(exist_ok=True)
-
-init_text_db(TEXT_DB_PATH)
+def display_translation_ui(db_path: Path):
+    with st.sidebar.expander("🌍 Translate PDFs", expanded=False):
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT filename FROM pdf_text")
+        files = [row[0] for row in cur.fetchall()]
+        
+        if not files:
+            st.info("Upload PDFs to enable translation")
+            conn.close()
+            return
+            
+        selected_file = st.selectbox("Select a PDF to translate", files, key="translation_select")
+        
+        languages = [
+            "French", "Spanish", "German", "Italian", "Portuguese", 
+            "Russian", "Japanese", "Chinese", "Arabic", "Hindi"
+        ]
+        target_language = st.selectbox("Select target language", languages, key="language_select")
+        
+        if st.button("Translate PDF", key="translate_button"):
+            if selected_file:
+                with st.spinner(f"Translating {selected_file} to {target_language}..."):
+                    # Get the original file path
+                    cur.execute("SELECT hash FROM pdf_text WHERE filename = ?", (selected_file,))
+                    original_hash = cur.fetchone()[0]
+                    original_path = UPLOAD_DIR / f"{original_hash}.pdf"
+                    
+                    # Create a new filename for the translated version
+                    translated_filename = f"{selected_file.split('.')[0]}_{target_language}.pdf"
+                    translated_path = TRANSLATED_DIR / translated_filename
+                    
+                    # Perform translation
+                    try:
+                        result_path = translate_pdf_with_gpt(str(original_path), str(translated_path), target_language)
+                        
+                        # Store the translated file info in the DB
+                        translated_hash = get_pdf_hash(Path(result_path).read_bytes())
+                        cur.execute("""
+                            INSERT INTO translated_pdfs 
+                            (original_hash, original_filename, translated_hash, translated_filename, target_language)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (original_hash, selected_file, translated_hash, translated_filename, target_language))
+                        conn.commit()
+                        
+                        # Provide download link
+                        with open(result_path, "rb") as file:
+                            st.download_button(
+                                label=f"Download {target_language} PDF",
+                                data=file,
+                                file_name=translated_filename,
+                                mime="application/pdf"
+                            )
+                        st.success(f"Translation to {target_language} completed!")
+                    except Exception as e:
+                        st.error(f"Translation failed: {e}")
+        
+        # Show previously translated PDFs
+        st.subheader("Previously Translated PDFs")
+        cur.execute("""
+            SELECT translated_filename, target_language, original_filename 
+            FROM translated_pdfs 
+            ORDER BY timestamp DESC
+        """)
+        translated_files = cur.fetchall()
+        
+        if translated_files:
+            for t_filename, t_language, o_filename in translated_files:
+                st.text(f"{o_filename} → {t_language}")
+                translated_path = TRANSLATED_DIR / t_filename
+                if translated_path.exists():
+                    with open(translated_path, "rb") as file:
+                        st.download_button(
+                            label=f"Download {t_filename}",
+                            data=file,
+                            file_name=t_filename,
+                            mime="application/pdf",
+                            key=f"dl_{t_filename}"
+                        )
+        else:
+            st.info("No translated PDFs yet")
+        
+        conn.close()
 
 def run_user_code(code: str):
     before = set(plt.get_fignums())
@@ -252,8 +393,29 @@ def run_user_code(code: str):
         plt.close(fig)
     return "✅ Executed your code and displayed the new figure(s)."
 
+# ──────────────────────────────────────────────────────────
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    st.error("Please set OPENAI_API_KEY in your .env file")
+openai.api_key = OPENAI_API_KEY  # Set for the openai module
+
+HERE = Path(__file__).parent
+UPLOAD_DIR = HERE / "uploaded_pdfs"
+EMBEDDINGS_DIR = HERE / "embeddings"
+IMAGES_DIR = HERE / "extracted_images"
+TRANSLATED_DIR = HERE / "translated_pdfs"  # New directory for translated PDFs
+TEXT_DB_PATH = HERE / "pdf_text.db"
+UPLOAD_DIR.mkdir(exist_ok=True)
+EMBEDDINGS_DIR.mkdir(exist_ok=True)
+IMAGES_DIR.mkdir(exist_ok=True)
+TRANSLATED_DIR.mkdir(exist_ok=True)  # Create the directory if it doesn't exist
+
+init_text_db(TEXT_DB_PATH)
+
 def main():
-    st.set_page_config(page_title="PDF Chat Assistant", page_icon="📚", layout="centered")
+    st.set_page_config(page_title="PDF Chat Assistant", page_icon="📚", layout="wide")
     st.title("📚 PDF Chat Assistant")
 
     # Session state
@@ -284,10 +446,11 @@ def main():
             for k in ["vectorstore", "conversation_chain"]:
                 st.session_state.pop(k, None)
 
-    # Sidebars: images, text, EDA
+    # Sidebars: images, text, EDA, translation (new)
     display_stored_images(TEXT_DB_PATH)
     display_stored_text(TEXT_DB_PATH)
     display_stored_eda(TEXT_DB_PATH)
+    display_translation_ui(TEXT_DB_PATH)  # Add the translation UI
 
     if not uploaded:
         return
@@ -342,7 +505,7 @@ def main():
                 st.session_state.qa_cache[q] = answer
             else:
                 answer = (
-                    "I’m sorry, the information you requested is not in the uploaded PDFs. "
+                    "I'm sorry, the information you requested is not in the uploaded PDFs. "
                     "Try a different query or upload more documents."
                 )
 
