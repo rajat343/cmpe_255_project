@@ -24,6 +24,7 @@ import re
 from PyPDF2 import PdfReader
 import openai
 from tenacity import retry, wait_random_exponential, stop_after_attempt
+import pytesseract
 
 ChatOpenAI.model_rebuild()
 
@@ -107,6 +108,17 @@ def is_pdf_processed(pdf_hash: str, db_path: Path) -> bool:
     conn.close()
     return exists
 
+def ocr_contains_caption(image: Image.Image) -> str:
+    try:
+        text = pytesseract.image_to_string(image)
+        for pattern in [r"(Figure|Table|Chart)\s*\d+[:\.]?", r"(Exhibit|Diagram)\s*\d+[:\.]?"]:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group()
+    except Exception:
+        pass
+    return None
+
 def extract_text_from_pdf(pdf_path: Path) -> str:
     reader = PdfReader(str(pdf_path))
     text_pages = [page.extract_text() for page in reader.pages if page.extract_text()]
@@ -130,11 +142,18 @@ def extract_images_from_pdf(pdf_path: Path, save_dir: Path, pdf_hash: str, db_pa
             with open(image_path, "wb") as f:
                 f.write(image_bytes)
             image_paths.append(str(image_path))
+
+            caption_text = None
+            try:
+                pil_img = Image.open(image_path)
+                caption_text = ocr_contains_caption(pil_img)
+            except Exception:
+                pass
             # store in DB
             cur.execute("""
-                INSERT INTO pdf_images (pdf_hash, filename, image_data, page_number, img_index, ext)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (pdf_hash, pdf_path.name, image_bytes, page_index + 1, img_index + 1, ext))
+                INSERT INTO pdf_images (pdf_hash, filename, image_data, page_number, img_index, ext, caption)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (pdf_hash, pdf_path.name, image_bytes, page_index + 1, img_index + 1, ext, caption_text))
 
     conn.commit()
     conn.close()
@@ -158,7 +177,8 @@ def init_text_db(db_path: Path):
             image_data BLOB,
             page_number INTEGER,
             img_index INTEGER,
-            ext TEXT
+            ext TEXT,
+            caption TEXT
         )
     """)
     # Add a new table for translated PDFs
@@ -203,6 +223,7 @@ def get_or_create_vectorstore(pdf_paths: List[Path]) -> FAISS:
     total_chars = sum(len(d.page_content) for d in docs)
     est_tokens = total_chars / 4
     st.sidebar.write(f"Embedding cost (est): ${est_tokens/1000*0.0001:.4f}")
+    print(f"Embedding cost (est): ${est_tokens/1000*0.0001:.4f}")
     return vs
 
 def setup_chain(vs: FAISS) -> ConversationalRetrievalChain:
@@ -252,6 +273,41 @@ def display_stored_text(db_path: Path):
             if result:
                 preview = result[0][:50000]
                 st.text_area("Preview:", value=preview, height=400)
+        conn.close()
+
+def display_figures_tables(db_path: Path):
+    with st.sidebar.expander("📊 View Extracted Figures/Tables", expanded=False):
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+
+        # Pull filenames that have OCR-detected captions
+        cur.execute("""
+            SELECT DISTINCT filename FROM pdf_images WHERE caption IS NOT NULL
+        """)
+        files = [row[0] for row in cur.fetchall()]
+        if not files:
+            st.info("No OCR-detected figures/tables found. Try uploading a PDF with diagrams or tables.")
+            conn.close()
+            return
+        
+        selected_file = st.selectbox("Select a PDF", files, key="fig_table_select")
+
+        if selected_file:
+            st.markdown("**📌 Figures & Tables Detected via OCR**")
+            cur.execute("""
+                SELECT page_number, img_index, caption, image_data FROM pdf_images
+                WHERE filename = ? AND caption IS NOT NULL ORDER BY page_number
+            """, (selected_file,))
+            
+            results = cur.fetchall()
+
+            if results:
+                for page, idx, caption, img_data in results:
+                    image = Image.open(io.BytesIO(img_data))
+                    st.image(image, caption=f"{caption} (Page {page})", use_container_width=True)
+            else:
+                st.warning("No OCR-detected captions found in this file.")
+
         conn.close()
 
 def display_stored_eda(db_path: Path):
@@ -449,6 +505,7 @@ def main():
     # Sidebars: images, text, EDA, translation (new)
     display_stored_images(TEXT_DB_PATH)
     display_stored_text(TEXT_DB_PATH)
+    display_figures_tables(TEXT_DB_PATH)
     display_stored_eda(TEXT_DB_PATH)
     display_translation_ui(TEXT_DB_PATH)  # Add the translation UI
 
