@@ -26,6 +26,11 @@ import openai
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 import pytesseract
 
+# For Advanced EDA
+from textblob import TextBlob
+import spacy
+nlp = spacy.load("en_core_web_sm")
+
 ChatOpenAI.model_rebuild()
 
 # Retry logic for transient errors (from layour.py)
@@ -311,7 +316,7 @@ def display_figures_tables(db_path: Path):
         conn.close()
 
 def display_stored_eda(db_path: Path):
-    with st.sidebar.expander("📈 View EDA (Word & Sentence Analysis)", expanded=False):
+    with st.sidebar.expander("📈 View EDA", expanded=False):
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("SELECT DISTINCT filename FROM pdf_text")
@@ -320,6 +325,8 @@ def display_stored_eda(db_path: Path):
         if selected_file:
             cur.execute("SELECT content FROM pdf_text WHERE filename = ?", (selected_file,))
             text = cur.fetchone()[0]
+
+            # Top word frequencies
             words = re.findall(r'\b\w+\b', text.lower())
             word_counts = Counter(words)
             df = pd.DataFrame(word_counts.most_common(10), columns=["Word", "Frequency"])
@@ -329,6 +336,7 @@ def display_stored_eda(db_path: Path):
             ax.set_title("Top 10 Words")
             st.pyplot(fig)
 
+            # Sentence length distribution
             sentences = re.split(r'[.!?]', text)
             lengths = [len(s.split()) for s in sentences if s.strip()]
             if lengths:
@@ -340,6 +348,52 @@ def display_stored_eda(db_path: Path):
                 ax2.set_xlabel("Words per sentence")
                 ax2.set_ylabel("Frequency")
                 st.pyplot(fig2)
+
+            # Sentiment Analysis
+            sentiments = [TextBlob(s).sentiment.polarity for s in sentences if s.strip()]
+            if sentiments:
+                avg_sentiment = round(sum(sentiments) / len(sentiments), 3)
+                st.markdown(f"**Average sentiment polarity:** {avg_sentiment} (−1 = negative, +1 = positive)")
+                fig3, ax3 = plt.subplots()
+                ax3.hist(sentiments, bins=20, color='purple', edgecolor='black')
+                ax3.set_title("Sentiment Distribution")
+                ax3.set_xlabel("Polarity")
+                ax3.set_ylabel("Sentence Count")
+                st.pyplot(fig3)
+
+            # POS Tag Distribution
+            doc = nlp(text[:100000])  # Limit for performance
+            pos_counts = Counter([token.pos_ for token in doc])
+            pos_df = pd.DataFrame(pos_counts.items(), columns=["POS", "Count"])
+            st.dataframe(pos_df.sort_values(by="Count", ascending=False))
+            fig4, ax4 = plt.subplots()
+            pos_df.plot(kind='bar', x='POS', y='Count', ax=ax4, legend=False)
+            ax4.set_title("Part of Speech Distribution")
+            st.pyplot(fig4)
+
+            # Narrative vs Analytical Tone Estimate
+            noun_count = sum(1 for token in doc if token.pos_ == 'NOUN')
+            verb_count = sum(1 for token in doc if token.pos_ == 'VERB')
+            adj_count = sum(1 for token in doc if token.pos_ == 'ADJ')
+            adv_count = sum(1 for token in doc if token.pos_ == 'ADV')
+            st.markdown(f"**Tone Summary:**")
+            st.markdown(f"- Nouns: {noun_count}")
+            st.markdown(f"- Verbs: {verb_count}")
+            st.markdown(f"- Adjectives: {adj_count}")
+            st.markdown(f"- Adverbs: {adv_count}")
+            if noun_count > (verb_count + adj_count):
+                st.info("🧾 This document leans toward **analytical** writing.")
+            else:
+                st.info("📘 This document leans toward **narrative** writing.")
+
+            # Named Entity Recognition
+            entities = [(ent.label_, ent.text) for ent in doc.ents]
+            ner_df = pd.DataFrame(entities, columns=["Type", "Entity"])
+            if not ner_df.empty:
+                top_ents = ner_df.value_counts().reset_index(name="Count").head(15)
+                st.markdown("**Top Named Entities**")
+                st.dataframe(top_ents)
+
         conn.close()
 
 def display_translation_ui(db_path: Path):

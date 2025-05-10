@@ -14,3 +14,9 @@ PyPDF2>=3.0
 Pillow
 pandas
 pytesseract
+# brew install tesseract
+
+nltk
+textblob
+spacy
+# python -m spacy download en_core_web_sm
