@@ -57,25 +57,26 @@ A Streamlit-based application that lets you upload PDF documents and interact wi
     -   Safe OpenMP & PyTorch workarounds baked into `app.py`
     -   Retry logic (tenacity) for transient translation errors
 
-## Team Members & Contributions
+## Team Members & Responsibilities
 
--   **Member 1** (m1)  
-    • Built the embedding pipeline and text-based QA chain using OpenAI Embeddings, FAISS, and LangChain.
+-   **Rajat Mishra**: PDF upload & QA pipeline  
+    Designed the file-upload/validation flow, FAISS vector store, LangChain document loader, OpenAI embeddings integration, and the ConversationalRetrievalChain for text-based Q&A.
 
--   **Member 2** (m2)  
-    • Implemented image/chart extraction, OCR processing, BLIP captioning, and the Exploratory Data Analysis dashboards.
+-   **Kunal Goel**: Image/table/chart extraction & EDA  
+    Implemented PyMuPDF image extraction, Tesseract OCR, regex-based caption detection, image preprocessing, metadata storage, and the Exploratory Data Analysis dashboards.
 
--   **Member 3** (m3)  
-    • Extended the retrieval chain to include image- and table-based Q&A by indexing OCR and caption snippets alongside text.
+-   **Reet Khanchandani**: UI & PDF translation  
+    Built the Streamlit interface, GPT-3.5-turbo translation pipeline (segmentation, batching, error handling, progress tracking), format preservation, multi-language support, and translation history in SQLite.
 
--   **Member 4** (m4)  
-    • Developed the GPT-powered PDF translation feature with page-by-page overlays and translation metadata tracking in SQLite.
+-   **Ritika Khandelwal**: Image/table Q&A & analytics  
+    Extended the retrieval chain to include OCR, enabling semantic Q&A over figures and tables, and added custom analysis features (POS tagging, NER, style metrics) via spaCy/TextBlob.
 
 ## Prerequisites
 
 -   Python 3.8 or higher
 -   Tesseract OCR (if you want Tesseract support)
 -   OpenAI API key
+-   (Optional) GPU/CUDA for faster BLIP captioning
 
 ## Installation
 
@@ -93,6 +94,4 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# (Optional) Download spaCy model
-python -m spacy download en_core_web_sm
 ```
