@@ -1,130 +1,98 @@
 # PDF Chat Assistant 📚
 
-A Streamlit-based application that allows users to upload PDF documents and interact with their content using natural language queries. The app uses OpenAI's GPT-4 model and FAISS vector storage for efficient document retrieval and question answering.
+A Streamlit-based application that lets you upload PDF documents and interact with their content—both text and images—using natural language. It combines OCR, semantic search, embedded Python execution, exploratory data analysis, and GPT-powered translation in one unified dashboard, all backed by a lightweight SQLite database.
 
-## Features
+## Key Features
 
--   PDF document upload and processing
--   Natural language querying of PDF content
--   Conversation memory for context-aware responses
--   Response caching for improved performance
--   Cost estimation for embeddings and queries
--   Clear chat history functionality
--   Vector store persistence for faster subsequent loads
+-   **PDF Upload & Storage**  
+    Upload one or more PDFs; files are hashed and stored locally under `uploaded_pdfs/`.
+
+-   **SQLite Persistence**  
+    All extracted text, images, captions and translation metadata are stored in a local SQLite database (`pdf_text.db`), ensuring fast lookups and schema migrations.
+
+-   **Text Extraction**  
+    Extracts raw page text with PyPDF2 and stores it in the `pdf_text` table.
+
+-   **Image Extraction & OCR**  
+    Pulls out every embedded image via PyMuPDF, runs PaddleOCR (and optional Tesseract) on each, and saves both the bytes and any detected captions in the `pdf_images` table.
+
+-   **BLIP Image Captioning**  
+    Generates high-level captions for each image using Hugging Face’s BLIP model and stores them alongside OCR text for richer retrieval.
+
+-   **Semantic Search (Text + Images)**  
+    Vectorizes all text and OCR/caption snippets via OpenAI Embeddings, indexes them with FAISS, and at query time retrieves the top-k semantically closest passages for GPT-4 to answer.
+
+-   **Conversational QA**  
+    Uses LangChain’s `ConversationalRetrievalChain` (GPT-4-turbo) to maintain chat history and provide context-aware, source-grounded answers.
+
+-   **Response Caching & Cost Estimation**  
+    Caches Q&A pairs for faster follow-ups and shows estimated embedding/query costs in the sidebar.
+
+-   **Python Code Execution**  
+    Paste `python …` blocks in chat to run them in a sandboxed namespace; any new Matplotlib figures appear inline.
+
+-   **Exploratory Data Analysis**  
+    In the “View EDA” sidebar you’ll find:
+
+    -   Top-10 word frequency bar chart
+    -   Sentence-length distribution histogram
+    -   Sentiment polarity histogram (via TextBlob)
+    -   Part-of-speech distribution bar chart (via spaCy)
+    -   Named-entity counts table
+
+-   **Figures & Tables Browser**  
+    Automatically detects “Figure N:” or “Table N:” captions in images and lets you browse all such images in a dedicated sidebar.
+
+-   **GPT-Powered PDF Translation**  
+    Pick any uploaded PDF and target language (French, Spanish, German, etc.); the app streams page-by-page text through GPT-3.5-turbo, overlays translations back into a new PDF, and lets you download it. All translations are recorded in SQLite for easy retrieval.
+
+-   **Conversation Management**
+
+    -   Clear chat history button
+    -   Persistent FAISS index for faster reloads
+    -   Memory buffer for multi-turn context
+
+-   **Robustness & Performance**
+    -   Automatic schema migrations for new columns
+    -   Safe OpenMP & PyTorch workarounds baked into `app.py`
+    -   Retry logic (tenacity) for transient translation errors
+
+## Team Members & Contributions
+
+-   **Member 1** (m1)  
+    • Built the embedding pipeline and text-based QA chain using OpenAI Embeddings, FAISS, and LangChain.
+
+-   **Member 2** (m2)  
+    • Implemented image/chart extraction, OCR processing, BLIP captioning, and the Exploratory Data Analysis dashboards.
+
+-   **Member 3** (m3)  
+    • Extended the retrieval chain to include image- and table-based Q&A by indexing OCR and caption snippets alongside text.
+
+-   **Member 4** (m4)  
+    • Developed the GPT-powered PDF translation feature with page-by-page overlays and translation metadata tracking in SQLite.
 
 ## Prerequisites
 
 -   Python 3.8 or higher
+-   Tesseract OCR (if you want Tesseract support)
 -   OpenAI API key
 
 ## Installation
 
-1. Clone the repository:
-
 ```bash
 git clone https://github.com/rajat343/cmpe_255_project.git
 cd cmpe_255_project
-```
 
-2. Create and activate a virtual environment (recommended):
-
-```bash
+# Create & activate a venv or conda env
 python -m venv venv
-# On Windows
-venv\Scripts\activate
-# On macOS/Linux
+# macOS/Linux
 source venv/bin/activate
-```
+# Windows
+# .\venv\Scripts\activate
 
-3. Install the required packages:
-
-```bash
+# Install dependencies
 pip install -r requirements.txt
+
+# (Optional) Download spaCy model
+python -m spacy download en_core_web_sm
 ```
-
-4. Create a `.env` file in the project root directory and add your OpenAI API key:
-
-```
-OPENAI_API_KEY=your_api_key_here
-```
-
-## Usage
-
-1. Start the Streamlit app:
-
-```bash
-streamlit run app.py
-```
-
-2. Open your web browser and navigate to the URL shown in the terminal (typically `http://localhost:8501`).
-
-3. Upload one or more PDF documents using the file uploader.
-
-4. Start asking questions about the content of your PDFs in the chat interface.
-
-## Project Structure
-
-```
-cmpe_255_project/
-├── app.py              # Main application file
-├── requirements.txt    # Python dependencies
-├── .env               # Environment variables
-├── uploaded_pdfs/     # Directory for stored PDFs
-└── embeddings/        # Directory for stored vector embeddings
-```
-
-## Features in Detail
-
-### Document Processing
-
--   PDFs are processed once and stored locally
--   Document embeddings are cached for faster subsequent loads
--   Multiple PDFs can be processed simultaneously
-
-### Conversation Management
-
--   Maintains conversation history for context-aware responses
--   Allows clearing of chat history
--   Caches question-answer pairs for improved performance
-
-### Cost Management
-
--   Displays estimated costs for embeddings generation
--   Shows per-query costs for API usage
--   Uses efficient retrieval methods to minimize API calls
-
-## Technical Implementation
-
-The application uses:
-
--   `langchain` for document processing and chat chain management
--   `FAISS` for efficient vector similarity search
--   `OpenAI's GPT-4` for generating responses
--   `Streamlit` for the web interface
--   Document hashing for efficient storage and retrieval
-
-## Limitations
-
--   PDF processing may take longer for large documents
--   API costs can accumulate with heavy usage
--   Requires stable internet connection for API calls
--   Maximum token limit applies based on GPT-4 model constraints
-
-## Cost Considerations
-
-The application uses OpenAI's API which has associated costs:
-
--   Embedding generation: $0.0001 per 1K tokens
--   Query processing:
-    -   Input: $0.0015 per 1K tokens
-    -   Output: $0.002 per 1K tokens
-
-## Contributing
-
-Feel free to submit issues, fork the repository, and create pull requests for any improvements.
-
-## Acknowledgments
-
--   Built with [Streamlit](https://streamlit.io/)
--   Uses [LangChain](https://python.langchain.com/) for document processing
--   Powered by [OpenAI](https://openai.com/) GPT-4
